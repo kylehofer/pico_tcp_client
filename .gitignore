@@ -1,0 +1,4 @@
+.vscode/
+build/
+.envrc
+pico_sdk_import.cmake
