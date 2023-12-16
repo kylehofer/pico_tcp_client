@@ -24,4 +24,4 @@ target_link_libraries(pico_tcp_client
     pico_cyw43_arch_lwip_poll
 )
 
-target_include_directories(pico_tcp_client PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_include_directories(pico_tcp_client PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")

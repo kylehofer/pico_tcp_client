@@ -357,7 +357,7 @@ int PicoTcpClient::connect(const char *hostname, uint16_t port)
     returnCode = tcp_connect(tcpControlBlock, &address, port, client_connected);
     cyw43_arch_lwip_end();
 
-    return returnCode == ERR_OK;
+    return returnCode;
 }
 
 size_t PicoTcpClient::write(uint8_t data)
