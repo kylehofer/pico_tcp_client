@@ -33,13 +33,6 @@
 #define PICOTCPCLIENT
 
 #include "stdint.h"
-#include "lwipopts.h"
-
-#include "pico/stdlib.h"
-#include "pico/cyw43_arch.h"
-
-#include "lwip/pbuf.h"
-#include "lwip/tcp.h"
 #include "Client.h"
 
 #define BASE_ERROR -1
@@ -62,8 +55,6 @@ class PicoTcpClient : Client
 {
 private:
     struct tcp_pcb *tcpControlBlock = NULL;
-    ip_addr_t address;
-    int port = -1;
     int availableData = 0;
     uint8_t *receivedData = NULL;
 
@@ -72,18 +63,23 @@ private:
 
     bool isConnected = false;
     bool isConfigured = false;
+    bool isConnecting = false;
+    bool waitingReply = false;
 
-    err_t writeDataBuffer(DataBuffer *buffer);
+    struct Private;
+
+    int8_t writeDataBuffer(DataBuffer *buffer);
+
+    int8_t onConnected(int errorCode);
+    int8_t received(void *data, int8_t errorCode);
+    int sent(uint16_t length);
+    int8_t poll();
+    void onError(int8_t errorCode);
 
 protected:
 public:
     PicoTcpClient();
     ~PicoTcpClient();
-    err_t onConnected(int errorCode);
-    err_t received(struct pbuf *payloadBuffer, err_t errorCode);
-    int sent(uint16_t length);
-    err_t poll();
-    void onError(err_t errorCode);
 
     virtual int connect(const char *host, uint16_t port) override;
     virtual size_t write(uint8_t) override;
@@ -93,6 +89,7 @@ public:
     virtual void stop() override;
     virtual uint8_t connected() override;
     virtual void sync() override;
+    void close();
 };
 
 #endif /* PICOTCPCLIENT */
