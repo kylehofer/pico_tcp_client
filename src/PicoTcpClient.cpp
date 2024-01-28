@@ -33,9 +33,19 @@
 
 #include <functional>
 #include <stdio.h>
+#include <lwipopts.h>
 
+#include <pico/stdlib.h>
+#include <pico/cyw43_arch.h>
+
+#include <lwip/pbuf.h>
+#include <lwip/tcp.h>
+
+#define DEBUGGING 1
 #ifdef DEBUGGING
-#define DEBUG(format, ...) printf(format, ##__VA_ARGS__);
+#define DEBUG(format, ...)     \
+    printf("PicoTcpClient: "); \
+    printf(format, ##__VA_ARGS__);
 #else
 #define DEBUG(out, ...)
 #endif
@@ -66,55 +76,45 @@ static DataBuffer *initializeDataBuffer(size_t length)
     return initializeDataBuffer(NULL, length);
 }
 
-static size_t allocateForReceiving(void **buffer, size_t required)
+// Declare all private member functions of SomeClass here
+struct PicoTcpClient::Private
 {
-    void *data = NULL;
-
-    while (required > 0 && (data = malloc(required)) != NULL)
+    static err_t client_poll(void *data, tcp_pcb *controlBlock)
     {
-        required >> 1;
+        PicoTcpClient *client = (PicoTcpClient *)data;
+        return client->poll();
     }
 
-    *buffer = data;
+    static err_t client_sent(void *data, tcp_pcb *controlBlock, uint16_t length)
+    {
+        PicoTcpClient *client = (PicoTcpClient *)data;
+        return client->sent(length);
+    }
 
-    return required;
-}
+    static err_t client_receive(void *data, tcp_pcb *controlBlock, struct pbuf *payloadBuffer, err_t errorCode)
+    {
+        PicoTcpClient *client = (PicoTcpClient *)data;
+        return client->received(payloadBuffer, errorCode);
+    }
 
-static err_t client_poll(void *data, tcp_pcb *controlBlock)
-{
-    PicoTcpClient *client = (PicoTcpClient *)data;
-    return client->poll();
-}
+    static void client_error(void *data, err_t errorCode)
+    {
+        PicoTcpClient *client = (PicoTcpClient *)data;
+        client->onError(errorCode);
+    }
 
-static err_t client_sent(void *data, tcp_pcb *controlBlock, uint16_t length)
-{
-    PicoTcpClient *client = (PicoTcpClient *)data;
-    return client->sent(length);
-}
-
-static err_t client_receive(void *data, tcp_pcb *controlBlock, struct pbuf *payloadBuffer, err_t errorCode)
-{
-    PicoTcpClient *client = (PicoTcpClient *)data;
-    return client->received(payloadBuffer, errorCode);
-}
-
-static void client_error(void *data, err_t errorCode)
-{
-    PicoTcpClient *client = (PicoTcpClient *)data;
-    client->onError(errorCode);
-}
-
-static err_t client_connected(void *data, tcp_pcb *tcpControlBlock, err_t errorCode)
-{
-    PicoTcpClient *client = (PicoTcpClient *)data;
-    return client->onConnected(errorCode);
-}
+    static err_t client_connected(void *data, tcp_pcb *tcpControlBlock, err_t errorCode)
+    {
+        PicoTcpClient *client = (PicoTcpClient *)data;
+        return client->onConnected(errorCode);
+    }
+};
 
 err_t PicoTcpClient::writeDataBuffer(DataBuffer *buffer)
 {
     DataBuffer *queue;
     int availableLength;
-    err_t tcpCode;
+    err_t tcpCode = 0;
 
     availableLength = tcp_sndbuf(tcpControlBlock);
 
@@ -194,8 +194,10 @@ int PicoTcpClient::sent(uint16_t length)
     return ERR_OK;
 }
 
-err_t PicoTcpClient::received(struct pbuf *payloadBuffer, err_t errorCode)
+err_t PicoTcpClient::received(void *data, err_t errorCode)
 {
+    struct pbuf *payloadBuffer = (struct pbuf *)data;
+
     if (!payloadBuffer)
     {
         // TODO: Error
@@ -251,6 +253,8 @@ err_t PicoTcpClient::onConnected(int errorCode)
     }
     DEBUG("Connect Success %d\n");
     isConnected = true;
+    isConnecting = false;
+    waitingReply = false;
     return ERR_OK;
 }
 
@@ -269,6 +273,8 @@ void PicoTcpClient::onError(err_t errorCode)
     default:
         break;
     }
+    close();
+    waitingReply = false;
     isConnected = false;
 }
 
@@ -283,81 +289,77 @@ PicoTcpClient::PicoTcpClient()
 
 PicoTcpClient::~PicoTcpClient()
 {
-    if (tcpControlBlock != NULL)
-    {
-        err_t errorCode = ERR_OK;
-
-        tcp_arg(tcpControlBlock, NULL);
-        tcp_poll(tcpControlBlock, NULL, 0);
-        tcp_sent(tcpControlBlock, NULL);
-        tcp_recv(tcpControlBlock, NULL);
-        tcp_err(tcpControlBlock, NULL);
-
-        errorCode = tcp_close(tcpControlBlock);
-        if (errorCode != ERR_OK)
-        {
-            tcp_abort(tcpControlBlock);
-        }
-        tcpControlBlock = NULL;
-    }
-#if PICO_CYW43_ARCH_POLL
-    cyw43_arch_poll();
-#endif
+    close();
 }
 
 int PicoTcpClient::connect(const char *hostname, uint16_t port)
 {
     if (isConnected)
     {
-        return BASE_ERROR;
+        DEBUG("Already connected\n");
+        return ERR_OK;
     }
+
+    isConnecting = true;
+
+    ip_addr_t address;
 
     isConfigured = false;
     if (!ip4addr_aton(hostname, &address))
     {
+        DEBUG("Failed to configure address\n");
         // TODO: Error Handler
         return BASE_ERROR;
     }
 
     if (port < 0)
     {
+        DEBUG("Invalid port: %d\n", port);
         // TODO: Error Handler
         return BASE_ERROR;
-    }
-
-    this->port = port;
-
-    isConfigured = true;
-    if (!isConfigured)
-    {
-        // TODO: Not Configured
-        return -1;
     }
 
     if (tcpControlBlock == NULL)
     {
         tcpControlBlock = tcp_new_ip_type(IP_GET_TYPE(&address));
 
+        tcpControlBlock->so_options |= SOF_KEEPALIVE;
+        tcpControlBlock->keep_idle = 5000;
+        tcpControlBlock->keep_intvl = 1000;
+
         if (tcpControlBlock == NULL)
         {
+            DEBUG("Failed to initialize TCP Control Block\n");
             // TODO: Error Handler
             return BASE_ERROR;
         }
 
         tcp_arg(tcpControlBlock, this);
-        tcp_poll(tcpControlBlock, client_poll, POLL_TIME_S * 2);
-        tcp_sent(tcpControlBlock, client_sent);
-        tcp_recv(tcpControlBlock, client_receive);
-        tcp_err(tcpControlBlock, client_error);
+        tcp_poll(tcpControlBlock, Private::client_poll, POLL_TIME_S * 2);
+        tcp_sent(tcpControlBlock, Private::client_sent);
+        tcp_recv(tcpControlBlock, Private::client_receive);
+        tcp_err(tcpControlBlock, Private::client_error);
     }
 
     err_t returnCode;
 
+    waitingReply = true;
     cyw43_arch_lwip_begin();
-    returnCode = tcp_connect(tcpControlBlock, &address, port, client_connected);
+    returnCode = tcp_connect(tcpControlBlock, &address, port, Private::client_connected);
     cyw43_arch_lwip_end();
 
-    return returnCode == ERR_OK;
+    if (returnCode == ERR_VAL)
+    {
+        DEBUG("Invalid arguments for tcp_connect.\n");
+        return returnCode;
+    }
+    else if (returnCode != ERR_OK)
+    {
+        DEBUG("tcp_connect could not be sent, code: %d.\n", returnCode);
+        return returnCode;
+    }
+
+    return 0;
 }
 
 size_t PicoTcpClient::write(uint8_t data)
@@ -396,26 +398,6 @@ int PicoTcpClient::available()
 {
     return availableData;
 }
-/**
-  ERR_OK         = 0,
-  ERR_MEM        = -1,
-  ERR_BUF        = -2,
-  ERR_TIMEOUT    = -3,
-  ERR_RTE        = -4,
-  ERR_INPROGRESS = -5,
-  ERR_VAL        = -6,
-  ERR_WOULDBLOCK = -7,
-  ERR_USE        = -8,
-  ERR_ALREADY    = -9,
-  ERR_ISCONN     = -10,
-  ERR_CONN       = -11,
-  ERR_IF         = -12,
-  ERR_ABRT       = -13,
-  ERR_RST        = -14,
-  ERR_CLSD       = -15,
-  ERR_ARG        = -16
-} err_enum_t;
- */
 
 int PicoTcpClient::read(void *buffer, size_t length)
 {
@@ -465,7 +447,9 @@ int PicoTcpClient::read(void *buffer, size_t length)
 
 void PicoTcpClient::stop()
 {
-    tcp_abort(tcpControlBlock);
+    isConnected = false;
+    isConnecting = false;
+    close();
 }
 
 uint8_t PicoTcpClient::connected()
@@ -475,6 +459,36 @@ uint8_t PicoTcpClient::connected()
 
 void PicoTcpClient::sync()
 {
+    if (isConnecting)
+    {
+        if (!waitingReply)
+        {
+        }
+    }
+#if PICO_CYW43_ARCH_POLL
+    cyw43_arch_poll();
+#endif
+}
+
+void PicoTcpClient::close()
+{
+    if (tcpControlBlock != NULL)
+    {
+        err_t errorCode = ERR_OK;
+
+        tcp_arg(tcpControlBlock, NULL);
+        tcp_poll(tcpControlBlock, NULL, 0);
+        tcp_sent(tcpControlBlock, NULL);
+        tcp_recv(tcpControlBlock, NULL);
+        tcp_err(tcpControlBlock, NULL);
+
+        errorCode = tcp_close(tcpControlBlock);
+        if (errorCode != ERR_OK)
+        {
+            tcp_abort(tcpControlBlock);
+        }
+        tcpControlBlock = NULL;
+    }
 #if PICO_CYW43_ARCH_POLL
     cyw43_arch_poll();
 #endif
